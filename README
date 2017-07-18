@@ -1,0 +1,2 @@
+A short talk about tracking down some memory leaks due to circular references
+in our application, tools to help find them and then the solutions

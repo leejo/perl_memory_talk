@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html>
+  <head>
+    <title>Perl, Caching, and Memory Leaks</title>
+    <meta http-equiv="Content-Type" content="text/html; charset=UTF-8"/>
+    <style type="text/css">
+      @import url(https://fonts.googleapis.com/css?family=Yanone+Kaffeesatz);
+      @import url(https://fonts.googleapis.com/css?family=Droid+Serif:400,700,400italic);
+      @import url(https://fonts.googleapis.com/css?family=Ubuntu+Mono:400,700,400italic);
+
+      body { font-family: 'Droid Serif'; }
+      pre { font-size: 80%; }
+      h1, h2, h3 {
+        font-family: 'Yanone Kaffeesatz';
+        font-weight: normal;
+      }
+      .remark-code, .remark-inline-code { font-family: 'Ubuntu Mono'; }
+    </style>
+  </head>
+  <body>
+    <textarea id="source">
+
+class: center, middle
+
+# Perl, Caching, and Memory Leaks
+
+Lee Johnson (LEEJO / leejo / lee@humanstate.com)
+
+???
+
+Warning! Possibly hand wavy in parts
+
+My C is very rusty (although it seems people *want* rust rather than C these days?)
+
+The perl internals are very deep, my knowledge of those internals is not deep
+
+This is just the basics
+
+---
+
+## We've all heard of this?
+
+--
+* ### Make it work
+
+--
+* ### Make it right
+
+--
+* ### Make it fast
+
+???
+The oft missed additional clause
+
+--
+* ### Fix all the bugs you introduced by making it fast
+
+???
+Where "bugs" could be memory leaks
+
+Immortal caches could be classified as memory leaks, if you have enough of them
+
+More on this later
+
+--
+
+### But first a recap...
+
+---
+
+## Spot the bug
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/resource.h>
+
+int main() {
+	int i, *ptr; struct rusage r_usage;
+
+	getrusage(RUSAGE_SELF,&r_usage);
+	printf("Start usage: %ld bytes\n",r_usage.ru_maxrss);
+
+	for ( i = 0; i < 100000; i++ ) {
+		ptr = (int*) malloc(1000 * sizeof(int));
+		// do something with ptr ...
+	}
+
+	getrusage(RUSAGE_SELF,&r_usage);
+	printf("  End usage: %ld bytes\n",r_usage.ru_maxrss);
+
+	return 0;
+}
+```
+
+???
+
+It should be obvious, this is a talk about memory leaks
+
+---
+
+## malloc() but no free()
+
+```c
+for ( i = 0; i < 100000; i++ ) {
+*	ptr = (int*) malloc(1000 * sizeof(int));
+	// do something with ptr ...
+}
+```
+
+--
+
+```bash
+> ./a.out
+Start usage: 1675264 bytes
+  End usage: 3538944 bytes
+
+```
+
+???
+Process has doubled in size
+
+We have to deal with this in C
+
+---
+
+## Clean up after use
+
+```c
+for ( i = 0; i < 100000; i++ ) {
+	ptr = (int*) malloc(1000 * sizeof(int));
+	// do something with ptr ...
+
+	// and free up memory
+*	free(ptr);
+}
+```
+
+--
+
+```bash
+> ./a.out
+Start usage: 1675264 bytes
+  End usage: 1728512 bytes
+```
+
+???
+Not a big deal in this trivial example
+
+But imagine this is somewhere deep in a library, and part of a long running process
+
+That's why we have tools like purify and valgrind
+
+---
+
+## What about Perl?
+
+```perl
+#!perl
+
+use strict;
+use warnings;
+use feature qw/ say /;
+use Unix::Getrusage;
+
+my ( $i,$ptr );
+
+printf("Start usage: %ld bytes\n",getrusage()->{ru_maxrss});
+
+for ( $i = 0; $i < 100000; $i++ ) {
+*    $ptr = [ ( 1 ) x 1000 ];
+    # do something with ptr ...
+}
+
+printf("  End usage: %ld bytes\n",getrusage()->{ru_maxrss});
+
+exit( 0 );
+```
+
+???
+It's not exactly the same, but close enough for what I'm getting at here
+
+---
+
+## Perl will handle memory usage for us
+
+```bash
+> perl leak.pl
+Start usage: 4177920 bytes
+  End usage: 4366336 bytes
+```
+
+???
+
+We had a "pointer" to an array of 1000 ints, done 100,000 times over
+
+Perl handled the memory allocation and freeing for us
+
+--
+
+### In Perl we don't have to worry about memory allocation ...
+
+--
+
+### Until we do
+
+--
+
+### Memory is cheap but not infinite
+
+???
+
+Or at least not infinitely fast
+
+---
+
+## On Reference Counting
+
+```
+perldoc perlguts
+```
+
+```
+Reference Counts and Mortality
+
+  Perl uses a reference count-driven garbage collection mechanism. SVs, AVs,
+  or HVs (xV for short in the following) start their life with a reference
+  count of 1. If the reference count of an xV ever drops to 0, then it will
+  be destroyed and its memory made available for reuse.
+
+  ...
+```
+
+???
+
+---
+
+## Devel::Peek
+
+
+```perl
+use Devel::Peek;
+
+for ( $i = 0; $i < 100000; $i++ ) {
+    $ptr = [ ( 1 ) x 1000 ];
+    # do something with ptr ...
+}
+
+*Dump( $ptr );
+```
+
+---
+
+## Devel::Peek
+
+```bash
+SV = IV(0x7fc9dc829350) at 0x7fc9dc829360
+  REFCNT = 1
+  FLAGS = (ROK)
+  RV = 0x7fc9dc828958
+  SV = PVAV(0x7fc9dc804e80) at 0x7fc9dc828958
+    REFCNT = 1
+    FLAGS = ()
+    ARRAY = 0x7fc9dc600010
+    FILL = 1
+    MAX = 1
+    FLAGS = (REAL)
+    Elt No. 0
+    SV = IV(0x7fc9dc8289f0) at 0x7fc9dc828a00
+      REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+    Elt No. 1
+    SV = IV(0x7fc9dc803270) at 0x7fc9dc803280
+      REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+	... (repeated 1000 times)
+```
+
+???
+This is the output from Devel::Peek::Dump(), I won't go into it other than to highlight (next slide)
+
+---
+
+## Devel::Peek
+
+```bash
+SV = IV(0x7fc9dc829350) at 0x7fc9dc829360
+* REFCNT = 1
+  FLAGS = (ROK)
+  RV = 0x7fc9dc828958
+  SV = PVAV(0x7fc9dc804e80) at 0x7fc9dc828958
+*   REFCNT = 1
+    FLAGS = ()
+    ARRAY = 0x7fc9dc600010
+    FILL = 1
+    MAX = 1
+    FLAGS = (REAL)
+    Elt No. 0
+    SV = IV(0x7fc9dc8289f0) at 0x7fc9dc828a00
+*     REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+    Elt No. 1
+    SV = IV(0x7fc9dc803270) at 0x7fc9dc803280
+*     REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+	... (repeated 1000 times)
+```
+
+???
+REFCNT - the reference count of each value
+
+Notice that it's 1 for every value here
+
+So when the top level REFCNT goes to 0 everything in this struct can be garbage collected
+
+When does that happen (see two slides up?)
+
+---
+
+## How Leaks Happen
+
+```perl
+#!perl
+
+use strict;
+use warnings;
+use feature qw/ say /;
+use Unix::Getrusage;
+
+my ( $i,$ptr,@arr );
+
+printf("Start usage: %ld bytes\n",getrusage()->{ru_maxrss});
+
+for ( $i = 0; $i < 100000; $i++ ) {
+*     push( @arr,$ptr = [ ( 1 ) x 1000 ] );
+    # do something with ptr ...
+}
+
+printf("  End usage: %ld bytes\n",getrusage()->{ru_maxrss});
+exit( 0 );
+```
+
+???
+
+Here's the same perl script with a subtle tweak.
+
+Note I'm talking about subtle memory leaks here, this is a slightly contrived example to illustrate how it happens.
+
+You can easily create death by "Out of memory!" by trying to read a 100GB file into an array, putting large amounts of data into global variables (another reason why they're bad), and so on.
+
+---
+
+## How Leaks Happen
+
+```bash
+> perl leak_2.pl
+Start usage: 4005888 bytes
+  End usage: 3261702144 bytes <--- Eeek!
+```
+
+--
+
+```perl
+use Devel::Peek;
+
+for ( $i = 0; $i < 100000; $i++ ) {
+*   push( @arr,$ptr = [ ( 1 ) x 1000 ] );
+    # do something with ptr ...
+}
+
+*Dump( $ptr );
+```
+
+???
+You probably *don't* want to run this
+
+---
+
+## How Leaks Happen
+
+```bash
+SV = IV(0x7f976c805420) at 0x7f976c805430
+  REFCNT = 1
+  FLAGS = (ROK)
+  RV = 0x7f976c003280
+  SV = PVAV(0x7f976c004e30) at 0x7f976c003280
+    REFCNT = 2
+    FLAGS = ()
+    ARRAY = 0x7f976bf013a0
+    FILL = 1
+    MAX = 1
+    FLAGS = (REAL)
+    Elt No. 0
+    SV = IV(0x7f976c0293b0) at 0x7f976c0293c0
+      REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+    Elt No. 1
+    SV = IV(0x7f976c028a98) at 0x7f976c028aa8
+      REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+	... (repeated 1000 times)
+```
+
+???
+
+See the difference between this and the previous Dump output?
+
+---
+
+## How Leaks Happen
+
+```bash
+SV = IV(0x7f976c805420) at 0x7f976c805430
+  REFCNT = 1
+  FLAGS = (ROK)
+  RV = 0x7f976c003280
+  SV = PVAV(0x7f976c004e30) at 0x7f976c003280
+*   REFCNT = 2
+    FLAGS = ()
+    ARRAY = 0x7f976bf013a0
+    FILL = 1
+    MAX = 1
+    FLAGS = (REAL)
+    Elt No. 0
+    SV = IV(0x7f976c0293b0) at 0x7f976c0293c0
+      REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+    Elt No. 1
+    SV = IV(0x7f976c028a98) at 0x7f976c028aa8
+      REFCNT = 1
+      FLAGS = (IOK,pIOK)
+      IV = 1
+	... (repeated 1000 times)
+```
+
+???
+
+Because the global @arr points to this, so even when $ptr is overwritten in each
+iteration of the loop there is still a pointer to the array(s).
+
+So this REFCNT doesn't ever go to 0, we have a memory leak
+
+---
+
+## Leaks via Caching
+
+- Cause::Campaign -> Donation
+- Donation -> Cause::Campaign
+- Roles to populate object attributes
+- Wasteful to build the same object more than once
+- Ephemeral Object Cache, sort of a singleton per unique entity
+- Oops! Circular reference
+
+---
+
+## Detecting Leaks
+
+- brute force
+- devel cycle
+- test leaktrace
+
+---
+
+## Fixing Leaks
+
+- weaken
+- weak_ref
+- tweak logic
+
+---
+
+    </textarea>
+    <script src="https://remarkjs.com/downloads/remark-latest.min.js" type="text/javascript">
+    </script>
+    <script type="text/javascript">
+        var slideshow = remark.create({
+            highlightLines: true
+        });
+    </script>
+  </body>
+</html>
