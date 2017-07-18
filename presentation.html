@@ -376,7 +376,7 @@ for ( $i = 0; $i < 100000; $i++ ) {
 ```
 
 ???
-You probably *don't* want to run this
+You probably *don't* want to run this, dumping out the tree of a 3GB struct isn't a great idea
 
 ---
 
@@ -449,30 +449,440 @@ So this REFCNT doesn't ever go to 0, we have a memory leak
 
 ---
 
+## A Little Bit About Our App
+
+![campaign](img/campaign.png)
+
+???
+
+A typical page on the site
+
+This is built from a template toolkit template that uses objects passed in via the mojo controller
+
+---
+
+## A Little Bit About Our App
+
+--
+* We try to do as much as possible with objects
+
+???
+
+They're just easier to work with, provide proper abstraction and encapsulation
+
+--
+* We break out repeated code into Roles
+
+--
+* This includes constructor logic
+
+???
+
+We have, for example, a populateActivist method (in a Role) that will return a new instance of an Activist object given the data from the db (which is a DBIx::Class::ResultSet object)
+
+--
+
+In the Activist class:
+```perl
+$self->_populateActivist( $activist_rs,$self );
+```
+
+???
+\_populateActivist will set all the attributes on $self here using the data from the resultset
+
+--
+
+In some other class:
+```perl
+my $Activist = $self->_populateActivist( $activist_rs );
+```
+
+???
+\_populateActivist will return a new instance of the Activist class here, with its attributes populated
+
+--
+* We are very greedy with data
+
+???
+
+We try to grab as much as possible from the database (through use of prefetch in dbic) and populate as many objects as necessary ahead of time.
+
+--
+* Going over the network to the db is expensive
+
+???
+Doing one query with several joins is cheaper than several deferred single queries because 90% of the time we end up needing that information anyway.
+
+---
+
+## A Little Bit About Our App
+
+![donations](img/donations.png)
+
+???
+
+Built from attributes on objects
+
+---
+
+## A Little Bit About Our App
+
+![donations](img/donations_objects.png)
+
+???
+
+Each blue dot is an attribute out of a single object, sometimes nested objects
+
+On some pages we can end up with the *same* object more than once - for example in this case an Activist can make many donations so they could occur more than once on the same page because a Donation object has an Activist object
+
+We can optimise that - one of the fundamental approaches to optimisations: remove duplicate work
+
+---
+
+## The Ephemeral Object Cache (EOC)
+
+--
+* `_populateFoo` methods use a globally scoped cache
+
+--
+* If an object *already* exists for the class return that object
+
+???
+
+Otherwise create the object then store it in the cache
+
+--
+* Objects are keyed in the cache by their class name and primary key
+
+--
+* They're sort of like singletons, but not
+
+--
+* The cache persists *only* for the life of the request
+
+???
+
+We nuke the entire cache at the start *and* end of each request
+
+--
+* In some cases this is a huge optimisation:
+
+```bash
+D> Nuking 30 EOC objects, reused 24 times
+```
+
+???
+The EOC here prevented the creation of 24 duplicate objects
+
+On some edge case pages these can go up into the hundreds, or even thousands
+
+--
+
+```bash
+D> Nuking 3675 EOC objects, reused 3561 times:
+Address - 2
+Agency - 1
+Agency::Account - 1
+Agency::Category - 1
+Beneficiary - 1
+Contribution::History - 1201
+Country - 1
+Currency - 1
+Payment - 1157
+Payment::Record - 1205
+Payment::Split - 87
+Property - 17
+```
+
+???
+
+A more in depth breakdown from the log file - the EOC makes a huge difference here.
+
+Why so many objects? Because edge cases, users do odd things with the site, every Payment object has a Currency object, etc.
+
+---
+
+## Object Methods
+
+```perl
+> perl \
+	-Ilib \
+	-MGivenGain::Model::Activist \
+	-E'say GivenGain::Model::Activist->new( id => 106579 )
+		->first_name'
+
+Lee
+```
+
+???
+
+Objects obviously have attributes
+
+--
+
+```perl
+say GivenGain::Model::Activist->new( id => 106579 )
+	->donations->[0]
+	->amount
+
+100
+```
+
+???
+
+Some of those attributes are objects
+
+--
+```perl
+say GivenGain::Model::Activist->new( id => 106579 )
+	->donations->[0]
+	->donor
+	->first_name
+
+Lee
+```
+
+???
+
+And those objects have attributes
+
+---
+
+## Round And Round And Round
+
+A contrived example:
+
+```perl
+say GivenGain::Model::Activist->new( id => 106579 )
+	->donations->[0]
+	->donor
+	->donations->[0]
+	->donor
+	->donations->[0]
+	->donor
+	->first_name
+
+Lee
+```
+
+--
+
+No circular references here though:
+
+```perl
+my $act = GivenGain::Model::Activist->new( id => 106579 );
+say $act->first_name;
+say $act;
+say $act->donations->[0]->donor;'
+
+Lee
+GivenGain::Model::Activist=HASH(0x2652388)
+GivenGain::Model::Activist=HASH(0x61b3dd8)
+```
+
+???
+Note different instances of the class
+
+---
+
 ## Leaks via Caching
 
-- Cause::Campaign -> Donation
-- Donation -> Cause::Campaign
-- Roles to populate object attributes
-- Wasteful to build the same object more than once
-- Ephemeral Object Cache, sort of a singleton per unique entity
-- Oops! Circular reference
+When we turn on the EOC?
+
+```perl
+*$main::eoc = {};
+
+my $act = GivenGain::Model::Activist->new( id => 106579 );
+say $act->first_name;
+say $act;
+say $act->donations->[0]->donor;'
+
+Lee
+GivenGain::Model::Activist=HASH(0x4639e08)
+GivenGain::Model::Activist=HASH(0x4639e08)
+```
+
+--
+
+Activist object now points back at itself. A circular reference:
+
+```perl
+find_cycle( $act );
+
+Cycle (1):
+    $GivenGain::Model::Activist::A->{'donations'} => \@B
+                           $B->[0] => \%GivenGain::Model::Donation::C
+    $GivenGain::Model::Donation::C->{'donor'} => \%GivenGain::Model::Activist::A
+```
+
+???
+
+As you can see, activist points to donations that points to a donor that points back at the activist.
+
+In a long running process this will never be garbage collected = a memory leak.
+
+More on find\_cycle in a bit
 
 ---
 
 ## Detecting Leaks
 
-- brute force
-- devel cycle
-- test leaktrace
+???
+
+The problem with a large app is you need at least some idea where the leak might be before you start to use specific tools
+
+---
+
+## Detecting Leaks
+
+### Brute Force Crawling
+
+```bash
+MEMORY_CHECK=4570,4571 prove -lrv t/www/010_page_load.t 2>&1 | grep grew
+
+# /cc/putfootrally2016/donations/ grew 0.15% (PID: 4571)
+# /cc/putfootrally2016/donations/page/2/ grew 0.15% (PID: 4571)
+```
+
+High level crawler script, can be told to watch memory of specific PIDs
+
+In theory, if there are no memory leaks, when run enough times the PIDs will eventually stop growing
+
+If there is a particular page that results in a leak the test will find it
+
+---
+
+## Detecting Leaks
+
+### Brute Force Destruction + Devel::Cycle
+
+```perl
+package Some::Role::Used::By::All::Classes;
+
+use Moose::Role;
+use Devel::Cycle;
+
+# everthing uses this role, so we can create a global DEMOLISH method
+# here that will be called by all objects on destruction
+sub DEMOLISH {
+	my ( $self ) = @_;
+
+	find_cycle( $self ) if $ENV{FIND_MEMORY_CYCLE};
+}
+```
+
+Set `FIND_MEMORY_CYCLE` in DEV.
+
+???
+
+But those objects with circular references won't be destroyed?
+
+Periodically restart the server, which will flush them out.
 
 ---
 
 ## Fixing Leaks
 
-- weaken
-- weak_ref
-- tweak logic
+Possibly the quick and easy way, may result in bugs.
+
+```perl
+use Scalar::Util qw/ weaken /;
+
+weaken( $ref );
+```
+
+???
+
+Prevents a reference count being held against the thing referenced by $ref
+
+--
+
+For Moose like attributes:
+
+```perl
+has foo => (
+	...
+	weak_ref => 1,
+);
+```
+
+This will almost certainly result in bugs.
+
+See [https://rjbs.manxome.org/rubric/entry/1837](https://rjbs.manxome.org/rubric/entry/1837)
+
+???
+
+Your attribute will probably be garbage collected prematurely
+
+You probably need to tweak your logic rather than do this
+
+---
+
+## Fixing Leaks
+
+```perl
+has foo => (
+	...
+	default => sub { ... },
+);
+```
+
+--
+
+Becomes:
+
+```perl
+my $_foo;
+
+sub foo {
+	return $_foo if $_foo;
+	my ( $self,... ) = @_;
+	$_foo = ...
+	return $_foo;
+);
+
+```
+
+???
+
+It's not as pretty but foo is no longer referenced by $self here, we have broken the cycle
+
+In this case we can still take advantage of the EOC
+
+---
+
+## Preventing Regressions
+
+### Brute Force Destruction + Devel::Cycle
+
+As before, a `DEMOLISH` method.
+
+???
+
+Really you want something more targeted?
+
+---
+
+## Preventing Regressions
+
+### Test::LeakTrace
+
+---
+
+## Questions?
+
+More info:
+
+* [perldoc perlguts](http://perldoc.perl.org/perlguts.html)
+* [perldoc perldebguts](http://perldoc.perl.org/perldebguts.html#Debugging-Perl-Memory-Usage)
+* [Devel::Cycle](https://metacpan.org/pod/Devel::Cycle)
+* [Test::Memory::Cycle](https://metacpan.org/pod/Test::Memory::Cycle)
+* [Devel::Gladiator](https://metacpan.org/pod/Devel::Gladiator)
+* [Devel::SizeMe](https://metacpan.org/pod/Devel::SizeMe)
+* [Devel::MAT](https://metacpan.org/pod/distribution/Devel-MAT/lib/Devel/MAT/UserGuide.pod)
+* [Test::LeakTrace At The Rescue](https://blog.celogeek.com/201211/277/perl-memory-leaks-testleaktrace-at-the-rescue/)
+* [Tim Bunce, Profiling Memory Usage LPW 2013](https://www.youtube.com/watch?v=UkEOQoOYYgQ)
+* [Nicolas Rochelemagne, Perl dependencies: playing with %INC and profiling memory, TPC 2016](https://www.youtube.com/watch?v=AMa1JWgG4yY)
 
 ---
 
