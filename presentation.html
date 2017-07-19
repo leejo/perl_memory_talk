@@ -849,6 +849,8 @@ It's not as pretty but foo is no longer referenced by $self here, we have broken
 
 In this case we can still take advantage of the EOC
 
+You don't have to use the package scoped variable if your caller stores the result somewhere itself
+
 ---
 
 ## Preventing Regressions
@@ -865,7 +867,105 @@ Really you want something more targeted?
 
 ## Preventing Regressions
 
+### Test::Memory::Cycle
+
+```perl
+use Test::Memory::Cycle;
+
+$main::eoc = {};
+
+my $Activist = GivenGain::Model::Activist->new(
+    id => 106579,
+
+is( $Activist->first_name,'Lee','->first_name' );
+is( $Activist->donations->[0]->donor->first_name,'Lee','cycle through' );
+
+memory_cycle_ok( $Activist );
+```
+---
+
+## Preventing Regressions
+
+### Test::Memory::Cycle
+
+```bash
+t/unit/givengain/model/activist_leak.t ..
+ok 1 - ->first_name
+ok 2 - cycle through
+not ok 3
+
+#   Failed test at t/unit/givengain/model/activist_leak.t line 20.
+# Cycle #1
+#     GivenGain::Model::Activist A->{donations} => @B
+#     @B->[0] => GivenGain::Model::Donation C
+#     GivenGain::Model::Donation C->{donor} => GivenGain::Model::Activist A
+...
+```
+
+---
+
+## Preventing Regressions
+
 ### Test::LeakTrace
+
+```perl
+use Test::LeakTrace;
+
+$main::eoc = {};
+
+no_leaks_ok {
+    my $Activist = GivenGain::Model::Activist->new(
+        id => 106579,
+    );
+
+    my $first_name = $Activist->first_name;
+    my $Donor = $Activist->donations->[0]->donor;
+} 'Activist does not leak';
+
+```
+
+---
+
+## Preventing Regressions
+
+### Test::LeakTrace
+
+```bash
+not ok 1 - Activist does not leak (leaks 75 <= 0)
+
+#   Failed test 'Activist does not leak (leaks 75 <= 0)'
+#   at t/unit/givengain/model/activist_leak.t line 19.
+#     '75'
+#         <=
+#     '0'
+```
+
+???
+
+Sits there for a while working out the tree then...
+
+--
+
+```bash
+# leaked REF(0x5efd438) from lib/GivenGain/Role/Populate/Activist.pm line 46.
+#   45: $act->location_id($activist->location_id);
+#   46: if ($activist->location) {
+#   47:         $act->location($act->_populateLocation($activist->location));
+# SV = IV(0x5efd428) at 0x5efd438
+#   REFCNT = 1
+#   FLAGS = (ROK)
+#   RV = 0x5f099d8
+#     SV = PVHV(0x5be48e0) at 0x5f099d8
+...
+```
+
+???
+
+Applying the aforementioned fix makes the test pass
+
+And also doesn't break our *other* tests
+
+Test::LeakTrace is quite slow so perhaps not one to run all the time
 
 ---
 
