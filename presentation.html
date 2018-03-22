@@ -765,6 +765,35 @@ If there is a particular page that results in a leak the test will find it
 
 ## Detecting Leaks
 
+### Brute Force Dumping
+
+```
+On Fri, 16 Mar 2018 17:39:23 +0000 Andrew Beverley wrote:
+1. Once the process was significantly large in memory use, I core-dumped
+it using gdb:
+
+  gdb --pid=1234
+  (gdb) gcore
+  (gdb) detach
+  (gdb) exit
+
+2. I ran the dump through strings to see if I could spot any patterns:
+
+  strings core.1234 | sort | uniq -c | sort -nr | less
+
+3. This showed thousands of strings containing data from SSL
+certificates. I then looked at the SSL-related modules and found this:
+
+https://metacpan.org/changes/distribution/Net-SSLeay#L29
+
+4. I upgraded Net::SSLeay, repeated the above process, and there was a
+significant reduction in that SSL certificate data in the dump.
+```
+
+---
+
+## Detecting Leaks
+
 ### Brute Force Destruction + Devel::Cycle
 
 ```perl
